@@ -1,4 +1,4 @@
-FROM hermes3:8b
+FROM mistral
 
 # Чуть выше temperature = непредсказуемость, характер
 PARAMETER temperature 0.8
