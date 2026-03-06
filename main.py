@@ -328,7 +328,7 @@ async def process_response(message: disnake.Message, text: str) -> None:
     await message.channel.send(response)
 
 
-@bot.command(aliases=["анализ"])
+@bot.command(name="анализ", aliases=["analyze"])
 @commands.has_permissions(administrator=True)
 async def analyze(ctx):
     """Анализ чата и создание досье на пользователей."""
