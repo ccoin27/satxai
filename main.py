@@ -8,7 +8,10 @@ import aiohttp
 import sqlite3
 import asyncio
 import os
+import json
+import random
 import re
+from urllib.parse import quote
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -24,9 +27,41 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+TENOR_API_KEY = os.getenv("TENOR_API_KEY")
 # Кастомная модель из Modelfile: ollama create satx-host -f Modelfile
 MODEL_NAME = "satx-host"
 PROMPT_LOG_DIR = os.getenv("PROMPT_LOG_DIR", "prompt_logs")
+ARCHIVE_CHANNEL_ID = 1371191476054393066  # канал для анализа
+
+# Пассивные реакции гифками: фраза -> поиск в Tenor
+GIF_REACT_KEYWORDS = {
+    "лол": "laughing",
+    "рофл": "laughing",
+    "ору": "laughing",
+    "смешно": "funny",
+    "кринж": "cringe",
+    "офигеть": "surprised",
+    "охуеть": "shocked",
+    "вайб": "vibing",
+    "го": "lets go",
+    "погнали": "lets go",
+    "красавчик": "thumbs up",
+    "респект": "respect",
+    "фейл": "fail",
+    "вин": "win",
+    "ахаха": "laughing",
+    "хаха": "laughing",
+    "кек": "laughing",
+    "ага": "agreement",
+    "ну да": "nodding",
+    "погнали": "running",
+}
+GIF_REACT_BASE_CHANCE = 0.04  # 4% на любое сообщение
+GIF_REACT_KEYWORD_CHANCE = 0.25  # 25% если есть ключевое слово
+GIF_URL_PATTERN = re.compile(
+    r"https?://(?:media\.tenor\.com|c\.tenor\.com|i\.giphy\.com|media\.giphy\.com|giphy\.com/gifs|tenor\.com/view)[^\s\)\]\"<>]+",
+    re.I,
+)
 
 # База данных
 db = sqlite3.connect("intelligence.db", check_same_thread=False)
@@ -66,9 +101,45 @@ cur.execute("""
         updated_at TEXT
     )
 """)
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS channel_gifs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        gif_url TEXT NOT NULL,
+        added_at TEXT NOT NULL
+    )
+""")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_logs_user ON logs(user_id)")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_logs ON channel_logs(channel_id)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_gifs ON channel_gifs(channel_id)")
+cur.execute(
+    "CREATE TABLE IF NOT EXISTS gif_scan_done (channel_id TEXT PRIMARY KEY)"
+)
 db.commit()
+
+# Отдельная база для архива всех сообщений (без дублирования)
+archive_db = sqlite3.connect("archive.db", check_same_thread=False)
+archive_db.execute("PRAGMA journal_mode=WAL")
+archive_cur = archive_db.cursor()
+archive_cur.execute("""
+    CREATE TABLE IF NOT EXISTS raw_messages (
+        message_id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        content TEXT NOT NULL,
+        links TEXT,
+        attachments TEXT,
+        created_at TEXT,
+        stored_at TEXT NOT NULL
+    )
+""")
+archive_cur.execute("CREATE INDEX IF NOT EXISTS idx_archive_channel ON raw_messages(channel_id)")
+archive_cur.execute("CREATE INDEX IF NOT EXISTS idx_archive_created ON raw_messages(created_at)")
+archive_db.commit()
+
+# Паттерн для извлечения всех ссылок
+URL_PATTERN = re.compile(r"https?://[^\s\)\]\"<>]+", re.I)
 
 bot = commands.Bot(command_prefix="!", intents=disnake.Intents.all())
 
@@ -159,6 +230,120 @@ def get_channel_context(channel_id: str, limit: int = 20) -> list[dict]:
     return [{"user_id": r[0], "username": r[1], "role": r[2], "content": r[3]} for r in reversed(rows)]
 
 
+def save_channel_gif(channel_id: str, gif_url: str) -> None:
+    """Сохранить URL гифки из чата."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    cur.execute(
+        "INSERT INTO channel_gifs (channel_id, gif_url, added_at) VALUES (?, ?, ?)",
+        (channel_id, gif_url, now),
+    )
+    cur.execute(
+        """
+        DELETE FROM channel_gifs WHERE channel_id = ? AND id NOT IN (
+            SELECT id FROM channel_gifs WHERE channel_id = ? ORDER BY id DESC LIMIT 100
+        )
+        """,
+        (channel_id, channel_id),
+    )
+    db.commit()
+
+
+def is_gif_scan_done(channel_id: str) -> bool:
+    cur.execute("SELECT 1 FROM gif_scan_done WHERE channel_id = ?", (channel_id,))
+    return cur.fetchone() is not None
+
+
+def mark_gif_scan_done(channel_id: str) -> None:
+    cur.execute("INSERT OR IGNORE INTO gif_scan_done (channel_id) VALUES (?)", (channel_id,))
+    db.commit()
+
+
+def get_channel_gifs(channel_id: str, limit: int = 30) -> list[str]:
+    """Получить гифки, которые раньше отправляли в канал."""
+    cur.execute(
+        "SELECT gif_url FROM channel_gifs WHERE channel_id = ? ORDER BY id DESC LIMIT ?",
+        (channel_id, limit),
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+async def _backfill_channel_gifs(channel: disnake.TextChannel) -> None:
+    """Сканировать историю канала и собрать гифки."""
+    cid = str(channel.id)
+    if is_gif_scan_done(cid):
+        return
+    try:
+        async for msg in channel.history(limit=200):
+            if msg.author.bot:
+                continue
+            for url in extract_gif_urls(msg):
+                save_channel_gif(cid, url)
+        mark_gif_scan_done(cid)
+    except Exception as e:
+        print(f"GIF backfill error: {e}")
+
+
+def save_to_archive(message: disnake.Message) -> None:
+    """Сохранить сообщение в архив. Без дубликатов (message_id PRIMARY KEY)."""
+    msg_id = str(message.id)
+    cid = str(message.channel.id)
+    uid = str(message.author.id)
+    username = (message.author.display_name or message.author.name)[:64]
+    content = (message.content or "")[:4000]
+    created = message.created_at.isoformat() if message.created_at else ""
+    stored = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    links = []
+    links.extend(URL_PATTERN.findall(content))
+    for embed in message.embeds:
+        if embed.url:
+            links.append(embed.url)
+        if embed.image and embed.image.url:
+            links.append(embed.image.url)
+        if embed.thumbnail and embed.thumbnail.url:
+            links.append(embed.thumbnail.url)
+        if embed.video and embed.video.url:
+            links.append(embed.video.url)
+    for att in message.attachments:
+        links.append(att.url)
+    links = list(dict.fromkeys(links))[:50]
+    links_json = json.dumps(links, ensure_ascii=False) if links else ""
+
+    atts = [{"url": a.url, "name": a.filename} for a in message.attachments[:20]]
+    atts_json = json.dumps(atts, ensure_ascii=False) if atts else ""
+
+    try:
+        archive_cur.execute(
+            """INSERT OR IGNORE INTO raw_messages
+               (message_id, channel_id, user_id, username, content, links, attachments, created_at, stored_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (msg_id, cid, uid, username, content, links_json, atts_json, created, stored),
+        )
+        archive_db.commit()
+    except Exception as e:
+        print(f"Archive save error: {e}")
+
+
+def extract_gif_urls(message: disnake.Message) -> list[str]:
+    """Извлечь URL гифок из сообщения (embeds, attachments, content)."""
+    urls = []
+    for embed in message.embeds:
+        if embed.image and embed.image.url:
+            urls.append(embed.image.url)
+        if embed.thumbnail and embed.thumbnail.url:
+            urls.append(embed.thumbnail.url)
+        if embed.video and embed.video.url:
+            urls.append(embed.video.url)
+    for att in message.attachments:
+        if att.content_type and "gif" in att.content_type:
+            urls.append(att.url)
+        elif att.filename and att.filename.lower().endswith(".gif"):
+            urls.append(att.url)
+    for m in GIF_URL_PATTERN.findall(message.content or ""):
+        urls.append(m)
+    return urls
+
+
 def get_channel_summary(channel_id: str) -> Optional[str]:
     cur.execute("SELECT summary FROM channel_state WHERE channel_id = ?", (channel_id,))
     row = cur.fetchone()
@@ -196,6 +381,40 @@ async def get_web(query: str) -> str:
     except Exception as e:
         print(f"Search error: {e}")
     return ""
+
+
+async def get_gif(search_term: str, session: aiohttp.ClientSession) -> Optional[str]:
+    """Поиск гифки через Tenor API. Возвращает URL или None."""
+    if not TENOR_API_KEY:
+        return None
+    try:
+        q = quote(search_term)
+        url = (
+            "https://tenor.googleapis.com/v2/search"
+            f"?q={q}&key={TENOR_API_KEY}&client_key=satxai&limit=5"
+        )
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        gif = random.choice(results)
+        media = gif.get("media_formats", {})
+        return media.get("gif", {}).get("url") or media.get("tinygif", {}).get("url")
+    except Exception as e:
+        print(f"Tenor error: {e}")
+    return None
+
+
+def _gif_react_search(text: str) -> Optional[str]:
+    """Определить поисковый запрос для гифки по тексту сообщения."""
+    lower = text.lower()
+    for kw, search in GIF_REACT_KEYWORDS.items():
+        if kw in lower:
+            return search
+    return None
 
 
 def _log_prompt(messages: list[dict], response: Optional[str], channel_id: str = "") -> None:
@@ -430,10 +649,14 @@ async def auto_analyze_channel(channel: disnake.TextChannel) -> None:
 
 # Команды через on_message (без @bot.command)
 CMD_ANALYZE = ("!анализ", "!analyze")
+CMD_ARCHIVE = ("!архив", "!archive")
 
 
 @bot.event
 async def on_message(message: disnake.Message):
+    # Архив: сохраняем ВСЕ сообщения (включая ботов), без дубликатов
+    save_to_archive(message)
+
     if message.author.bot:
         return
 
@@ -442,14 +665,23 @@ async def on_message(message: disnake.Message):
         cmd = raw.split()[0].lower() if raw.split() else raw.lower()
         if cmd in CMD_ANALYZE:
             await cmd_analyze(message)
+        elif cmd in CMD_ARCHIVE and message.author.guild_permissions.administrator:
+            await message.channel.send("⏳ Сканирую архив...")
+            await _archive_backfill_and_analyze()
+            await message.channel.send("✅ Архив обновлён и проанализирован.")
         return
 
-    clean = re.sub(r"<@!?\d+>", "", message.content).strip()
+    cid = str(message.channel.id)
+
+    # Собираем гифки из чата (embeds, attachments, ссылки)
+    for gif_url in extract_gif_urls(message):
+        save_channel_gif(cid, gif_url)
+
+    clean = re.sub(r"<@!?\d+>", "", message.content or "").strip()
     if not clean:
         return
 
     uid = str(message.author.id)
-    cid = str(message.channel.id)
     username = message.author.display_name or message.author.name
 
     # Сохраняем в оба лога (память канала + личная)
@@ -468,11 +700,113 @@ async def on_message(message: disnake.Message):
 
     if mentioned or should_react:
         await process_response(message, clean)
+        return
+
+    # Пассивный режим: реагируем гифками из истории чата (или Tenor)
+    search_term = _gif_react_search(clean)
+    chance = GIF_REACT_KEYWORD_CHANCE if search_term else GIF_REACT_BASE_CHANCE
+    if random.random() < chance:
+        gif_url = None
+        stored = get_channel_gifs(cid)
+        if not stored and not is_gif_scan_done(cid):
+            asyncio.create_task(_backfill_channel_gifs(message.channel))
+        if stored:
+            gif_url = random.choice(stored)
+        if not gif_url and TENOR_API_KEY:
+            term = search_term or random.choice(list(GIF_REACT_KEYWORDS.values()))
+            async with aio_session() as session:
+                gif_url = await get_gif(term, session)
+        if gif_url:
+            try:
+                await message.reply(gif_url)
+            except Exception:
+                pass
+
+
+async def _archive_backfill_and_analyze() -> None:
+    """Сканировать канал архива и анализировать."""
+    channel = bot.get_channel(ARCHIVE_CHANNEL_ID)
+    if not channel:
+        for guild in bot.guilds:
+            channel = guild.get_channel(ARCHIVE_CHANNEL_ID)
+            if channel:
+                break
+    if not channel:
+        print("Archive channel not found")
+        return
+    cid = str(channel.id)
+    try:
+        count = 0
+        async for msg in channel.history(limit=1000):
+            save_to_archive(msg)
+            count += 1
+        print(f"Archive backfill: {count} messages")
+    except Exception as e:
+        print(f"Archive backfill error: {e}")
+        return
+
+    # Анализ архива
+    archive_cur.execute(
+        """SELECT username, content, links FROM raw_messages
+           WHERE channel_id = ? AND (content != '' OR links != '')
+           ORDER BY created_at DESC LIMIT 500""",
+        (cid,),
+    )
+    rows = archive_cur.fetchall()
+    if len(rows) < 10:
+        return
+    chunks = []
+    for username, content, links_json in rows[:200]:
+        parts = [f"{username}: {content}"] if content else []
+        if links_json:
+            try:
+                links = json.loads(links_json)
+                if links:
+                    parts.append(f"[ссылки: {', '.join(links[:3])}]")
+            except Exception:
+                pass
+        if parts:
+            chunks.append(" ".join(parts))
+    if len(chunks) < 10:
+        return
+    text = "\n".join(chunks[-150:])
+    prompt = f"""Проанализируй переписку из чата (сообщения + ссылки). Дай краткое резюме:
+- О чём говорят, какие темы
+- Тон и настроение
+- Ключевые ссылки/ресурсы
+- Что можно улучшить в комьюнити
+
+Переписка:
+{text[:8000]}"""
+    messages = [
+        {"role": "system", "content": "Ты аналитик комьюнити. Кратко и по делу."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        async with aio_session() as session:
+            summary = await ollama_chat(messages, session)
+        if summary:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            cur.execute(
+                """INSERT OR REPLACE INTO channel_state (channel_id, summary, updated_at)
+                   VALUES (?, ?, ?)""",
+                (cid, summary[:500], now),
+            )
+            db.commit()
+            print(f"Archive analysis done: {summary[:100]}...")
+    except Exception as e:
+        print(f"Archive analysis error: {e}")
 
 
 @bot.event
 async def on_ready():
     print(f"--- Бот готов — модель: {MODEL_NAME} ---")
+    asyncio.create_task(_delayed_archive_task())
+
+
+async def _delayed_archive_task() -> None:
+    await asyncio.sleep(10)
+    await _archive_backfill_and_analyze()
 
 
 if __name__ == "__main__":

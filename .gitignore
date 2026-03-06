@@ -1,5 +1,8 @@
 .env
 intelligence.db
+archive.db
+archive.db-wal
+archive.db-shm
 prompt_logs/
 __pycache__/
 *.pyc
