@@ -31,7 +31,7 @@ TENOR_API_KEY = os.getenv("TENOR_API_KEY")
 # Кастомная модель из Modelfile: ollama create satx-host -f Modelfile
 MODEL_NAME = "satx-host"
 PROMPT_LOG_DIR = os.getenv("PROMPT_LOG_DIR", "prompt_logs")
-ARCHIVE_CHANNEL_ID = 1371191476054393066  # канал для анализа
+ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID", "1371191476054393066"))
 
 # Пассивные реакции гифками: фраза -> поиск в Tenor
 GIF_REACT_KEYWORDS = {
@@ -666,9 +666,12 @@ async def on_message(message: disnake.Message):
         if cmd in CMD_ANALYZE:
             await cmd_analyze(message)
         elif cmd in CMD_ARCHIVE and message.author.guild_permissions.administrator:
-            await message.channel.send("⏳ Сканирую архив...")
-            await _archive_backfill_and_analyze()
-            await message.channel.send("✅ Архив обновлён и проанализирован.")
+            status = await message.channel.send("⏳ Сканирую архив...")
+            summary = await _archive_backfill_and_analyze()
+            if summary:
+                await status.edit(content=f"✅ Архив обновлён.\n\n**Анализ:**\n{summary[:1500]}")
+            else:
+                await status.edit(content="✅ Архив обновлён. (анализ не выполнен — мало данных)")
         return
 
     cid = str(message.channel.id)
@@ -723,7 +726,7 @@ async def on_message(message: disnake.Message):
                 pass
 
 
-async def _archive_backfill_and_analyze() -> None:
+async def _archive_backfill_and_analyze() -> Optional[str]:
     """Сканировать канал архива и анализировать."""
     channel = bot.get_channel(ARCHIVE_CHANNEL_ID)
     if not channel:
@@ -732,8 +735,13 @@ async def _archive_backfill_and_analyze() -> None:
             if channel:
                 break
     if not channel:
+        try:
+            channel = await bot.fetch_channel(ARCHIVE_CHANNEL_ID)
+        except Exception:
+            pass
+    if not channel:
         print("Archive channel not found")
-        return
+        return None
     cid = str(channel.id)
     try:
         count = 0
@@ -743,7 +751,7 @@ async def _archive_backfill_and_analyze() -> None:
         print(f"Archive backfill: {count} messages")
     except Exception as e:
         print(f"Archive backfill error: {e}")
-        return
+        return None
 
     # Анализ архива
     archive_cur.execute(
@@ -754,7 +762,7 @@ async def _archive_backfill_and_analyze() -> None:
     )
     rows = archive_cur.fetchall()
     if len(rows) < 10:
-        return
+        return None
     chunks = []
     for username, content, links_json in rows[:200]:
         parts = [f"{username}: {content}"] if content else []
@@ -768,7 +776,7 @@ async def _archive_backfill_and_analyze() -> None:
         if parts:
             chunks.append(" ".join(parts))
     if len(chunks) < 10:
-        return
+        return None
     text = "\n".join(chunks[-150:])
     prompt = f"""Проанализируй переписку из чата (сообщения + ссылки). Дай краткое резюме:
 - О чём говорят, какие темы
@@ -794,8 +802,10 @@ async def _archive_backfill_and_analyze() -> None:
             )
             db.commit()
             print(f"Archive analysis done: {summary[:100]}...")
+            return summary
     except Exception as e:
         print(f"Archive analysis error: {e}")
+    return None
 
 
 @bot.event
