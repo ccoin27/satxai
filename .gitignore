@@ -1,0 +1,7 @@
+.env
+intelligence.db
+prompt_logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
