@@ -328,13 +328,13 @@ async def process_response(message: disnake.Message, text: str) -> None:
     await message.channel.send(response)
 
 
-@bot.command(name="анализ")
-@commands.has_permissions(administrator=True)
-async def analyze(ctx):
-    """Анализ чата и создание досье на пользователей."""
-    msg_status = await ctx.send("🔍 Анализирую чат...")
+async def cmd_analyze(message: disnake.Message) -> None:
+    """Анализ чата и создание досье (только для админов)."""
+    if not message.author.guild_permissions.administrator:
+        return
+    msg_status = await message.channel.send("🔍 Анализирую чат...")
     users_data = {}
-    async for m in ctx.channel.history(limit=500):
+    async for m in message.channel.history(limit=500):
         if m.author.bot:
             continue
         uid = str(m.author.id)
@@ -428,12 +428,20 @@ async def auto_analyze_channel(channel: disnake.TextChannel) -> None:
         print(f"Auto-analyze error: {e}")
 
 
+# Команды через on_message (без @bot.command)
+CMD_ANALYZE = ("!анализ", "!analyze")
+
+
 @bot.event
 async def on_message(message: disnake.Message):
     if message.author.bot:
         return
-    if message.content.startswith("!"):
-        await bot.process_commands(message)
+
+    raw = message.content.strip()
+    if raw.startswith("!"):
+        cmd = raw.split()[0].lower() if raw.split() else raw.lower()
+        if cmd in CMD_ANALYZE:
+            await cmd_analyze(message)
         return
 
     clean = re.sub(r"<@!?\d+>", "", message.content).strip()
